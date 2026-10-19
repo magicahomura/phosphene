@@ -239,6 +239,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         // ---- REUSE: this surface's context already exists ----
         if let existing = registry.surface(for: key) {
             traceLog("  [acquire=\(acquireID)] REUSE ctx=\(existing.contextId) \(key) storedVideoID=\(existing.videoID ?? "nil") newChoice=\(choiceConfiguration ?? "nil") renderer=\(existing.renderer.map { "#\($0.debugID)" } ?? "nil")")
+            traceContextAssociation(existing.caContext, phase: "reuse", contextID: existing.contextId)
             traceSurfaceGeometry("reuse-before", acquireID: acquireID, key: key, contextID: existing.contextId, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: existing.rootLayer, videoLayer: existing.renderer?.displayLayer, rendererID: existing.renderer?.debugID, cachedStill: cachedStill)
 
             // Geometry may have changed since this surface was created: a bigger or
@@ -331,6 +332,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         }
         caContext.layer = rootLayer
         CATransaction.flush()
+        traceContextAssociation(caContext, phase: "created", contextID: contextId)
         traceSurfaceGeometry("context-created", acquireID: acquireID, key: key, contextID: contextId, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: rootLayer, cachedStill: cachedStill)
 
         guard let replyObj = createRemoteContextXPC(contextId: contextId) else {

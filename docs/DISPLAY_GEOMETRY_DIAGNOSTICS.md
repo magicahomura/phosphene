@@ -24,6 +24,16 @@ geometry, so they cannot locate the first divergence or prove a fixed-scale or
 cache cause. The new log entries are intended to compare a normal start with one
 controlled display-off/on recovery before selecting a geometry change.
 
+Build 2203 adds opt-in metadata from the actual `CAContext` object in the
+WallpaperAgent extension process. On its normal reacquire, the main and side
+contexts retained `options={displayId:2}` and `options={displayId:3}` respectively,
+while the private `displayId`, `displayNumber`, and `displayMask` getters all read
+zero. The same getters read zero in an independent, non-hosted context, so these
+values alone do not establish a fault. The 2203 install restarted WallpaperAgent;
+the earlier dual-off fault is therefore represented by the saved 2202 log, and a
+fresh physical reproduction is needed to capture 2203 context metadata during the
+fault itself.
+
 Keep verbose logging enabled only for that short reproduction, retain the log
 locally, and turn logging off after capture. Do not post the raw log: ordinary
 extension log lines can contain local paths and wallpaper identifiers.
