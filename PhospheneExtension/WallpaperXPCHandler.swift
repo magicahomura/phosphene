@@ -232,7 +232,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         // Diagnostic bisection: host a still only (no video pipeline). Same context
         // reuse/create/reply as below, but no renderer.
         if Bisect.stillOnly {
-            acquireStillOnlyBisect(key: key, displayID: displayID, destSize: destSize, scaleFactor: scaleFactor, videoURL: videoURL, cachedStill: cachedStill, choice: choiceConfiguration, reply: reply)
+            acquireStillOnlyBisect(key: key, displayID: displayID, destSize: destSize, scaleFactor: scaleFactor, videoURL: videoURL, choice: choiceConfiguration, reply: reply)
             return
         }
 
@@ -435,52 +435,90 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         Task { await writeBMPSnapshot(videoURL: videoURL, videoID: choiceConfiguration, displayPixelWidth: w, displayPixelHeight: h) }
     }
 
-    /// Bisection acquire: identical CAContext reuse/create/reply as `acquireBody`, but
-    /// hosts a still (via `bisectShowStill`) instead of a VideoRenderer. Runs on
-    /// `Lifecycle.queue`. See StillBisect.swift.
-    private func acquireStillOnlyBisect(key: SurfaceKey, displayID: UInt32?, destSize: CGSize, scaleFactor: CGFloat, videoURL: URL?, cachedStill: CGImage?, choice: String?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
-        if let existing = SurfaceRegistry.shared.surface(for: key) {
-            traceLog("  [bisect] REUSE ctx=\(existing.contextId) display=\(key.displayID) stored=\(existing.videoID ?? "nil") new=\(choice ?? "nil")")
-            guard let replyObj = createRemoteContextXPC(contextId: existing.contextId) else {
-                reply(nil, NSError(domain: "PhospheneExtension", code: 3, userInfo: nil)); return
+    /// One decoded image through the remote sample-buffer layer; no live feed loop.
+    private func acquireStillOnlyBisect(key: SurfaceKey, displayID: UInt32?, destSize: CGSize, scaleFactor: CGFloat, videoURL: URL?, choice: String?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+        let registry = SurfaceRegistry.shared
+        if let existing = registry.surface(for: key) {
+            if registry.updateGeometryIfChanged(destSize: destSize, scaleFactor: scaleFactor, for: key) != nil {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                existing.rootLayer.frame = CGRect(origin: .zero, size: destSize)
+                existing.rootLayer.contentsScale = scaleFactor
+                if let layer = Bisect.layer(in: existing.rootLayer) {
+                    layer.frame = existing.rootLayer.bounds
+                    layer.contentsScale = scaleFactor
+                }
+                CATransaction.commit()
+                CATransaction.flush()
             }
-            reply(replyObj, nil)
-            if existing.videoID == choice {
-                traceLog("  [bisect] SAME choice → no re-seed")
+            let layer: AVSampleBufferDisplayLayer?
+            if existing.videoID == choice, let current = Bisect.layer(in: existing.rootLayer), current.isReadyForDisplay {
+                layer = current
+            } else if let sample = bisectDecodeStill(videoURL: videoURL, for: key) {
+                layer = bisectShowStill(sample: sample, rootLayer: existing.rootLayer, for: key)
+            } else {
+                layer = nil
+            }
+            guard let layer, let replyObj = createRemoteContextXPC(contextId: existing.contextId) else {
+                reply(nil, NSError(domain: "PhospheneExtension", code: 5, userInfo: [NSLocalizedDescriptionKey: "No decoded still image"]))
                 return
             }
-            bisectShowStill(videoURL: videoURL, cachedStill: cachedStill, rootLayer: existing.rootLayer, for: key)
-            SurfaceRegistry.shared.updateVideoID(choice, for: key)
+            registry.updateVideoID(choice, for: key)
+            replyWhenStillReady(layer, contextId: existing.contextId, key: key, replyObj: replyObj, reply: reply)
             return
         }
 
-        var contextOptions: [String: Any] = [:]
-        if let did = displayID {
-            contextOptions["displayId"] = did
+        // Prepare the media pipeline before the first remote context is allocated.
+        guard let sample = bisectDecodeStill(videoURL: videoURL, for: key) else {
+            reply(nil, NSError(domain: "PhospheneExtension", code: 5, userInfo: [NSLocalizedDescriptionKey: "No decoded still image"]))
+            return
         }
-        let caContextRaw: Any? = contextOptions.isEmpty
+        var contextOptions: [String: Any] = [:]
+        if let did = displayID { contextOptions["displayId"] = did }
+        let raw: Any? = contextOptions.isEmpty
             ? CAContext.remoteContext()
             : CAContext.perform(NSSelectorFromString("remoteContextWithOptions:"), with: contextOptions)?.takeUnretainedValue()
-        guard let caContext = caContextRaw as? CAContext, caContext.contextId != 0 else {
+        guard let context = raw as? CAContext, context.contextId != 0 else {
             reply(nil, NSError(domain: "PhospheneExtension", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to create remote CAContext"]))
             return
         }
-        let rootLayer = CALayer()
-        rootLayer.frame = CGRect(origin: .zero, size: destSize)
-        rootLayer.contentsScale = scaleFactor
-        rootLayer.contentsGravity = .resizeAspectFill
-        caContext.layer = rootLayer
-        CATransaction.flush()
-        guard let replyObj = createRemoteContextXPC(contextId: caContext.contextId) else {
-            reply(nil, NSError(domain: "PhospheneExtension", code: 3, userInfo: nil)); return
+        let root = CALayer()
+        root.frame = CGRect(origin: .zero, size: destSize)
+        root.contentsScale = scaleFactor
+        context.layer = root
+        guard let layer = bisectShowStill(sample: sample, rootLayer: root, for: key),
+              let replyObj = createRemoteContextXPC(contextId: context.contextId) else {
+            reply(nil, NSError(domain: "PhospheneExtension", code: 5, userInfo: [NSLocalizedDescriptionKey: "No decoded still image"]))
+            return
         }
-        SurfaceRegistry.shared.install(
-            HostedSurface(caContext: caContext, contextId: caContext.contextId, rootLayer: rootLayer, renderer: nil, displayID: displayID, videoID: choice, isPreview: acquiredAsPreview, destSize: destSize, scaleFactor: scaleFactor),
-            for: key,
-        )
-        reply(replyObj, nil)
-        traceLog("  [bisect] CREATED ctx=\(caContext.contextId) display=\(key.displayID) choice=\(choice ?? "nil")")
-        bisectShowStill(videoURL: videoURL, cachedStill: cachedStill, rootLayer: rootLayer, for: key)
+        registry.install(HostedSurface(caContext: context, contextId: context.contextId, rootLayer: root, renderer: nil, displayID: displayID, videoID: choice, isPreview: acquiredAsPreview, destSize: destSize, scaleFactor: scaleFactor), for: key)
+        traceLog("  [bisect] CREATED ctx=\(context.contextId) display=\(key.displayID) choice=\(choice ?? "nil")")
+        replyWhenStillReady(layer, contextId: context.contextId, key: key, replyObj: replyObj, reply: reply)
+    }
+
+    /// Enqueue is asynchronous. Do not report an invisible/failed layer as a ready
+    /// context. A context generation check also prevents replying with an old surface.
+    private func replyWhenStillReady(_ layer: AVSampleBufferDisplayLayer, contextId: UInt32, key: SurfaceKey, replyObj: Any, attempt: Int = 0, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+        guard SurfaceRegistry.shared.surface(for: key)?.contextId == contextId else {
+            reply(nil, NSError(domain: "PhospheneExtension", code: 6, userInfo: [NSLocalizedDescriptionKey: "Still surface was superseded"]))
+            return
+        }
+        let renderer = layer.sampleBufferRenderer
+        if layer.isReadyForDisplay {
+            extensionLog("  [bisect] READY ctx=\(contextId) display=\(key.displayID) status=\(renderer.status.rawValue) frame=\(layer.frame) scale=\(layer.contentsScale)")
+            reply(replyObj, nil)
+        } else if renderer.status == .failed || attempt >= 40 {
+            extensionLog("  [bisect] NOT READY ctx=\(contextId) display=\(key.displayID) status=\(renderer.status.rawValue) error=\(String(describing: renderer.error))")
+            _ = SurfaceRegistry.shared.tearDown(key)
+            reply(nil, NSError(domain: "PhospheneExtension", code: 5, userInfo: [NSLocalizedDescriptionKey: "Still image did not become ready for display"]))
+        } else {
+            let boxedLayer = SendableBox(value: layer)
+            let boxedReply = SendableBox(value: replyObj)
+            nonisolated(unsafe) let handler = self
+            Lifecycle.queue.asyncAfter(deadline: .now() + 0.05) {
+                handler.replyWhenStillReady(boxedLayer.value, contextId: contextId, key: key, replyObj: boxedReply.value, attempt: attempt + 1, reply: reply)
+            }
+        }
     }
 
     func update(withId id: Any?, request: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
