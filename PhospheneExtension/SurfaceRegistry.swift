@@ -5,6 +5,8 @@ import QuartzCore
 /// The resources behind one hosted surface: its remote `CAContext`, the root layer
 /// WallpaperAgent composites, and the renderer drawing into it.
 struct HostedSurface: @unchecked Sendable {
+    /// New on every install, including a same-key surface recreation.
+    let generation: UUID = UUID()
     let caContext: AnyObject // CAContext (private class, hold as AnyObject)
     let contextId: UInt32
     let rootLayer: CALayer
@@ -22,6 +24,11 @@ struct HostedSurface: @unchecked Sendable {
     /// A `VideoRenderer.create` is in flight for this surface. Stops a racing acquire
     /// from building a duplicate renderer on the same root layer.
     var rendererPending = false
+}
+
+enum RendererInstallResult {
+    case installed(previous: VideoRenderer?)
+    case rejected
 }
 
 /// Owns every hosted surface's resources, keyed by surface. Playback decisions live in
@@ -69,23 +76,45 @@ final class SurfaceRegistry: Sendable {
     }
 
     /// Release a create claim without installing a renderer (the create threw).
-    func clearRendererPending(for key: SurfaceKey) {
-        lock.withLock { $0.surfaces[key]?.rendererPending = false }
+    func clearRendererPending(for key: SurfaceKey, generation: UUID) {
+        lock.withLock { contents in
+            guard var surface = contents.surfaces[key], surface.generation == generation else { return }
+            surface.rendererPending = false
+            contents.surfaces[key] = surface
+        }
     }
 
     /// Install a surface's renderer, returning the one it replaces for the caller to stop.
-    func setRenderer(_ renderer: VideoRenderer, videoID: String?, for key: SurfaceKey) -> VideoRenderer? {
-        let previous = lock.withLock { contents -> VideoRenderer? in
-            guard var surface = contents.surfaces[key] else { return nil }
+    func setRenderer(_ renderer: VideoRenderer, videoID: String?, for key: SurfaceKey, generation: UUID) -> RendererInstallResult {
+        let result = lock.withLock { contents -> RendererInstallResult in
+            guard var surface = contents.surfaces[key], surface.generation == generation else { return .rejected }
             let previous = surface.renderer
             surface.renderer = renderer
             surface.videoID = videoID
             surface.rendererPending = false
             contents.surfaces[key] = surface
-            return previous
+            return .installed(previous: previous)
         }
-        traceLog("  [setRenderer] \(key) new=#\(renderer.debugID) replacing=\(previous.map { "#\($0.debugID)" } ?? "nil") videoID=\(videoID ?? "nil")")
-        return previous
+        switch result {
+        case let .installed(previous):
+            traceLog("  [setRenderer] \(key) generation=\(generation) new=#\(renderer.debugID) replacing=\(previous.map { "#\($0.debugID)" } ?? "nil") videoID=\(videoID ?? "nil")")
+        case .rejected:
+            traceLog("  [setRenderer] REJECTED stale generation=\(generation) key=\(key) renderer=#\(renderer.debugID)")
+        }
+        return result
+    }
+
+    /// Remove a renderer only when it is still the renderer installed on this
+    /// generation. Used when startup fails after the registry accepted the object.
+    func discardRenderer(_ renderer: VideoRenderer, for key: SurfaceKey, generation: UUID) -> Bool {
+        lock.withLock { contents in
+            guard var surface = contents.surfaces[key], surface.generation == generation,
+                  surface.renderer === renderer else { return false }
+            surface.renderer = nil
+            surface.rendererPending = false
+            contents.surfaces[key] = surface
+            return true
+        }
     }
 
     /// Record a surface's geometry, returning the surface only when it changed since
@@ -147,6 +176,17 @@ final class SurfaceRegistry: Sendable {
     @discardableResult
     func tearDown(_ key: SurfaceKey) -> Bool {
         guard let removed = lock.withLock({ $0.surfaces.removeValue(forKey: key) }) else { return false }
+        removed.renderer?.stop()
+        invalidateRemoteContext(removed.caContext)
+        return true
+    }
+
+    @discardableResult
+    func tearDown(_ key: SurfaceKey, generation: UUID) -> Bool {
+        guard let removed = lock.withLock({ contents -> HostedSurface? in
+            guard contents.surfaces[key]?.generation == generation else { return nil }
+            return contents.surfaces.removeValue(forKey: key)
+        }) else { return false }
         removed.renderer?.stop()
         invalidateRemoteContext(removed.caContext)
         return true

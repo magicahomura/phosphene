@@ -32,6 +32,10 @@ enum Lifecycle {
 
     /// Pending per-surface teardown timers. Touched only on `queue`.
     nonisolated(unsafe) static var teardownTimers: [SurfaceKey: DispatchWorkItem] = [:]
+    /// A first-time surface is decoded before its CAContext is allocated. Acquires
+    /// for that same key wait here and replay after the first acquire has settled.
+    nonisolated(unsafe) static var preparingSurfaceKeys: Set<SurfaceKey> = []
+    nonisolated(unsafe) static var deferredAcquires: [SurfaceKey: [DispatchWorkItem]] = [:]
 
     /// Grace between an invalidate of a display's LIVE wallpaper and actually tearing it
     /// down. A re-acquire (display woke / switched) cancels it; only a display that stays
@@ -218,6 +222,16 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         let surfaceUUID = extractWallpaperUUID(fromID: id) ?? Self.fallbackSurfaceUUID(forDisplay: displayID0)
         let key = SurfaceKey(displayID: displayID0, surfaceUUID: surfaceUUID)
         let registry = SurfaceRegistry.shared
+        if registry.surface(for: key) == nil, Lifecycle.preparingSurfaceKeys.contains(key) {
+            nonisolated(unsafe) let handler = self
+            let boxedID = SendableBox(value: id)
+            let boxedRequest = SendableBox(value: request)
+            Lifecycle.deferredAcquires[key, default: []].append(DispatchWorkItem {
+                handler.acquireBody(id: boxedID.value, request: boxedRequest.value, reply: reply)
+            })
+            traceLog("  [acquire=\(acquireID)] same-key first-frame preparation in flight; queued for generation-safe reuse")
+            return
+        }
         registry.register(wallpaperID: surfaceUUID, as: key)
         if choiceConfiguration == shuffleChoiceID, let renderChoice {
             PlaybackStore.post(.shufflePicked(renderChoice))
@@ -256,6 +270,8 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
                 extensionLog("  [acquire=\(acquireID)] REUSE geometry changed → resized \(key) to \(destSize) @\(scaleFactor)x")
             }
 
+            ScaleOverlayDiag.install(rootLayer: existing.rootLayer, for: key)
+
             traceSurfaceGeometry("reuse-ready", acquireID: acquireID, key: key, contextID: existing.contextId, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: existing.rootLayer, videoLayer: existing.renderer?.displayLayer, rendererID: existing.renderer?.debugID, cachedStill: cachedStill)
 
             guard let replyObj = createRemoteContextXPC(contextId: existing.contextId) else {
@@ -284,20 +300,31 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
                 registry.updateVideoID(choiceConfiguration, for: key)
             } else if registry.claimRendererCreate(for: key) {
                 let boxedRoot = SendableBox(value: existing.rootLayer)
-                Task(name: "Attach renderer \(key)") { [boxedRoot, videoURL, cachedStill, selector, key, choiceConfiguration] in
+                let generation = existing.generation
+                Task(name: "Attach renderer \(key)") { [boxedRoot, videoURL, selector, key, choiceConfiguration, generation] in
                     let renderer: VideoRenderer
                     do {
-                        renderer = try await VideoRenderer.create(rootLayer: boxedRoot.value, videoURL: videoURL, stillImage: cachedStill)
+                        let decodedStill = try await VideoRenderer.decodeInitialFrame(videoURL: videoURL)
+                        renderer = try await VideoRenderer.create(rootLayer: boxedRoot.value, videoURL: videoURL, surfaceKey: key, stillImage: decodedStill)
                     } catch {
                         extensionLog("  [Renderer] swap create failed: \(error)")
-                        SurfaceRegistry.shared.clearRendererPending(for: key)
+                        SurfaceRegistry.shared.clearRendererPending(for: key, generation: generation)
                         return
                     }
                     renderer.setVariantSelector(selector)
-                    let old = SurfaceRegistry.shared.setRenderer(renderer, videoID: choiceConfiguration, for: key)
-                    old?.stop()
+                    guard case let .installed(old) = SurfaceRegistry.shared.setRenderer(renderer, videoID: choiceConfiguration, for: key, generation: generation) else {
+                        renderer.stop()
+                        return
+                    }
                     await PlaybackStore.shared.follow(renderer, surface: key)
-                    await renderer.start()
+                    let startResult = await renderer.start()
+                    guard case .ready = startResult else {
+                        extensionLog("  [Renderer] swap start failed: \(startResult)")
+                        _ = SurfaceRegistry.shared.discardRenderer(renderer, for: key, generation: generation)
+                        renderer.stop()
+                        return
+                    }
+                    old?.stop()
                 }
             } else {
                 traceLog("  [acquire] renderer create already in flight for \(key) — skipping duplicate")
@@ -308,6 +335,38 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         }
 
         // ---- CREATE: first acquire for this surface ----
+        if let videoURL, !ColorDiag.enabled {
+            Lifecycle.preparingSurfaceKeys.insert(key)
+            let boxedHandler = SendableBox(value: self)
+            Task(name: "Prepare first video image \(key)") { [videoURL, key, acquireID, displayID = displayID, displayID0, isPreview = isPreview, destSize = destSize, scaleFactor = scaleFactor, choiceConfiguration = choiceConfiguration, renderChoice = renderChoice, reply, boxedHandler] in
+                do {
+                    let initialImage = try await VideoRenderer.decodeInitialFrame(videoURL: videoURL)
+                    Lifecycle.queue.async {
+                        boxedHandler.value.createPreparedSurface(
+                            acquireID: acquireID,
+                            key: key,
+                            displayID: displayID,
+                            displayID0: displayID0,
+                            isPreview: isPreview,
+                            destSize: destSize,
+                            scaleFactor: scaleFactor,
+                            choiceConfiguration: choiceConfiguration,
+                            renderChoice: renderChoice,
+                            videoURL: videoURL,
+                            initialImage: initialImage,
+                            reply: reply,
+                        )
+                    }
+                } catch {
+                    Lifecycle.queue.async {
+                        extensionLog("  [acquire=\(acquireID)] first decoded image failed: \(error)")
+                        reply(nil, NSError(domain: "PhospheneExtension", code: 7, userInfo: [NSLocalizedDescriptionKey: "Could not decode the initial video image: \(error.localizedDescription)"]))
+                        boxedHandler.value.finishSurfacePreparation(for: key)
+                    }
+                }
+            }
+            return
+        }
         var contextOptions: [String: Any] = [:]
         if let did = displayID {
             contextOptions["displayId"] = did
@@ -345,6 +404,11 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             HostedSurface(caContext: caContext, contextId: contextId, rootLayer: rootLayer, renderer: nil, displayID: displayID, videoID: choiceConfiguration, isPreview: isPreview, destSize: destSize, scaleFactor: scaleFactor),
             for: key,
         )
+        guard let installedSurface = registry.surface(for: key) else {
+            reply(nil, NSError(domain: "PhospheneExtension", code: 6, userInfo: [NSLocalizedDescriptionKey: "Surface disappeared during acquire"]))
+            return
+        }
+        let generation = installedSurface.generation
         extensionLog("  [acquire=\(acquireID)] Created context \(contextId) for \(key)")
 
         // The XPC reply is deferred until the new context displays video. WallpaperAgent
@@ -371,6 +435,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             gradientLayer.contentsScale = scaleFactor
             CATransaction.begin(); CATransaction.setDisableActions(true)
             rootLayer.addSublayer(gradientLayer)
+            ScaleOverlayDiag.install(rootLayer: rootLayer, for: key)
             CATransaction.commit(); CATransaction.flush()
             reply(replyObj, nil)
             extensionLog("  No video file found — solid color fallback")
@@ -398,33 +463,39 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             let boxedRoot = SendableBox(value: rootLayer)
             let boxedReply = SendableBox(value: replyObj)
             let selector = makeVariantSelector(choice: renderChoice, fallback: videoURL)
-            Task(name: "Create renderer \(key)") { [coldStart, boxedRoot, boxedReply, videoURL, cachedStill, selector, key, choiceConfiguration, acquireID, contextID = contextId, destSize, scaleFactor] in
+            Task(name: "Create renderer \(key)") { [coldStart, boxedRoot, boxedReply, videoURL, cachedStill, selector, key, choiceConfiguration, acquireID, contextID = contextId, destSize, scaleFactor, generation] in
                 let renderer: VideoRenderer
                 do {
-                    renderer = try await VideoRenderer.create(rootLayer: boxedRoot.value, videoURL: videoURL, stillImage: cachedStill)
+                    let decodedStill = try await VideoRenderer.decodeInitialFrame(videoURL: videoURL)
+                    renderer = try await VideoRenderer.create(rootLayer: boxedRoot.value, videoURL: videoURL, surfaceKey: key, stillImage: decodedStill)
                 } catch {
                     extensionLog("  [Renderer] Failed to create: \(error)")
-                    SurfaceRegistry.shared.clearRendererPending(for: key)
-                    reply(boxedReply.value, nil) // unblock the acquire regardless
+                    SurfaceRegistry.shared.clearRendererPending(for: key, generation: generation)
+                    _ = SurfaceRegistry.shared.tearDown(key, generation: generation)
+                    reply(nil, NSError(domain: "PhospheneExtension", code: 7, userInfo: [NSLocalizedDescriptionKey: "Could not prepare the first video image: \(error.localizedDescription)"]))
                     return
                 }
+                ScaleOverlayDiag.install(rootLayer: boxedRoot.value, for: key)
                 traceSurfaceGeometry("renderer-created", acquireID: acquireID, key: key, contextID: contextID, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: boxedRoot.value, videoLayer: renderer.displayLayer, rendererID: renderer.debugID, cachedStill: cachedStill)
-                // Cold start: the IOSurface still is seeded and flushed, so the agent can
-                // host our context without a black gap while the video comes up over it.
-                if coldStart {
-                    reply(boxedReply.value, nil)
-                    traceLog("  [acquire] cold start → replied after still seeded for \(videoURL.lastPathComponent)")
-                }
                 renderer.setVariantSelector(selector)
-                let old = SurfaceRegistry.shared.setRenderer(renderer, videoID: choiceConfiguration, for: key)
+                guard case let .installed(old) = SurfaceRegistry.shared.setRenderer(renderer, videoID: choiceConfiguration, for: key, generation: generation) else {
+                    renderer.stop()
+                    reply(nil, NSError(domain: "PhospheneExtension", code: 8, userInfo: [NSLocalizedDescriptionKey: "Surface was replaced while video initialized"]))
+                    return
+                }
                 await PlaybackStore.shared.follow(renderer, surface: key)
-                await renderer.start()
+                let startResult = await renderer.start()
+                guard case .ready = startResult else {
+                    extensionLog("  [Renderer] start failed for \(key): \(startResult)")
+                    _ = SurfaceRegistry.shared.tearDown(key, generation: generation)
+                    reply(nil, NSError(domain: "PhospheneExtension", code: 9, userInfo: [NSLocalizedDescriptionKey: "Video renderer did not produce a ready first frame: \(startResult)"]))
+                    return
+                }
                 traceSurfaceGeometry("first-frame-ready", acquireID: acquireID, key: key, contextID: contextID, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: boxedRoot.value, videoLayer: renderer.displayLayer, rendererID: renderer.debugID, cachedStill: cachedStill)
                 // Switch: reply once the first frame is composited. Either way, stop the
                 // old renderer once the agent has been told to swap off it.
-                if !coldStart {
-                    reply(boxedReply.value, nil)
-                }
+                reply(boxedReply.value, nil)
+                traceLog("  [acquire] \(coldStart ? "cold start" : "switch") replied after decoded seed and first media frame for \(videoURL.lastPathComponent)")
                 old?.stop()
             }
         } else {
@@ -433,6 +504,110 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         }
         let w = Int(destSize.width * scaleFactor), h = Int(destSize.height * scaleFactor)
         Task { await writeBMPSnapshot(videoURL: videoURL, videoID: choiceConfiguration, displayPixelWidth: w, displayPixelHeight: h) }
+    }
+
+    /// Allocate the new remote context only after a real video image has decoded.
+    /// Runs on Lifecycle.queue; renderer startup remains asynchronous.
+    private func createPreparedSurface(
+        acquireID: String,
+        key: SurfaceKey,
+        displayID: UInt32?,
+        displayID0: UInt32,
+        isPreview: Bool,
+        destSize: CGSize,
+        scaleFactor: CGFloat,
+        choiceConfiguration: String?,
+        renderChoice: String?,
+        videoURL: URL,
+        initialImage: CGImage,
+        reply: @escaping @Sendable (Any?, (any Error)?) -> Void,
+    ) {
+        var contextOptions: [String: Any] = [:]
+        if let displayID { contextOptions["displayId"] = displayID }
+        let caContextRaw: Any? = contextOptions.isEmpty
+            ? CAContext.remoteContext()
+            : CAContext.perform(NSSelectorFromString("remoteContextWithOptions:"), with: contextOptions)?.takeUnretainedValue()
+        guard let caContext = caContextRaw as? CAContext, caContext.contextId != 0 else {
+            reply(nil, NSError(domain: "PhospheneExtension", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to create remote CAContext"]))
+            finishSurfacePreparation(for: key)
+            return
+        }
+        let contextId = caContext.contextId
+        let rootLayer = CALayer()
+        rootLayer.frame = CGRect(origin: .zero, size: destSize)
+        rootLayer.contentsScale = scaleFactor
+        rootLayer.contentsGravity = .resizeAspectFill
+        caContext.layer = rootLayer
+        CATransaction.flush()
+        traceContextAssociation(caContext, phase: "created-after-decode", contextID: contextId)
+        traceSurfaceGeometry("context-created-after-decode", acquireID: acquireID, key: key, contextID: contextId, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: rootLayer)
+
+        guard let replyObj = createRemoteContextXPC(contextId: contextId) else {
+            invalidateRemoteContext(caContext)
+            reply(nil, NSError(domain: "PhospheneExtension", code: 3, userInfo: [NSLocalizedDescriptionKey: "Could not create remote context reply"]))
+            finishSurfacePreparation(for: key)
+            return
+        }
+        SurfaceRegistry.shared.install(
+            HostedSurface(caContext: caContext, contextId: contextId, rootLayer: rootLayer, renderer: nil, displayID: displayID, videoID: choiceConfiguration, isPreview: isPreview, destSize: destSize, scaleFactor: scaleFactor),
+            for: key,
+        )
+        guard let surface = SurfaceRegistry.shared.surface(for: key), SurfaceRegistry.shared.claimRendererCreate(for: key) else {
+            _ = SurfaceRegistry.shared.tearDown(key)
+            reply(nil, NSError(domain: "PhospheneExtension", code: 8, userInfo: [NSLocalizedDescriptionKey: "Could not reserve the decoded surface for renderer startup"]))
+            finishSurfacePreparation(for: key)
+            return
+        }
+        let generation = surface.generation
+        let selector = makeVariantSelector(choice: renderChoice, fallback: videoURL)
+        let boxedRoot = SendableBox(value: rootLayer)
+        let boxedReply = SendableBox(value: replyObj)
+        let boxedHandler = SendableBox(value: self)
+        Task(name: "Start decoded renderer \(key)") { [boxedRoot, boxedReply, videoURL, initialImage, selector, key, choiceConfiguration, generation, acquireID, contextId, destSize, scaleFactor, reply, boxedHandler] in
+            let renderer: VideoRenderer
+            do {
+                renderer = try await VideoRenderer.create(rootLayer: boxedRoot.value, videoURL: videoURL, surfaceKey: key, stillImage: initialImage)
+            } catch {
+                Lifecycle.queue.async {
+                    _ = SurfaceRegistry.shared.tearDown(key, generation: generation)
+                    reply(nil, NSError(domain: "PhospheneExtension", code: 9, userInfo: [NSLocalizedDescriptionKey: "Could not create video renderer: \(error.localizedDescription)"]))
+                    boxedHandler.value.finishSurfacePreparation(for: key)
+                }
+                return
+            }
+            renderer.setVariantSelector(selector)
+            guard case .installed = SurfaceRegistry.shared.setRenderer(renderer, videoID: choiceConfiguration, for: key, generation: generation) else {
+                renderer.stop()
+                Lifecycle.queue.async {
+                    reply(nil, NSError(domain: "PhospheneExtension", code: 10, userInfo: [NSLocalizedDescriptionKey: "Surface generation changed before renderer installation"]))
+                    boxedHandler.value.finishSurfacePreparation(for: key)
+                }
+                return
+            }
+            await PlaybackStore.shared.follow(renderer, surface: key)
+            let result = await renderer.start()
+            guard case .ready = result else {
+                Lifecycle.queue.async {
+                    _ = SurfaceRegistry.shared.tearDown(key, generation: generation)
+                    reply(nil, NSError(domain: "PhospheneExtension", code: 11, userInfo: [NSLocalizedDescriptionKey: "Renderer did not start with a valid frame: \(result)"]))
+                    boxedHandler.value.finishSurfacePreparation(for: key)
+                }
+                return
+            }
+            traceSurfaceGeometry("first-frame-ready", acquireID: acquireID, key: key, contextID: contextId, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: boxedRoot.value, videoLayer: renderer.displayLayer, rendererID: renderer.debugID)
+            reply(boxedReply.value, nil)
+            let width = Int(destSize.width * scaleFactor), height = Int(destSize.height * scaleFactor)
+            Task { await writeBMPSnapshot(videoURL: videoURL, videoID: choiceConfiguration, displayPixelWidth: width, displayPixelHeight: height) }
+            Lifecycle.queue.async { boxedHandler.value.finishSurfacePreparation(for: key) }
+        }
+    }
+
+    /// Clear the first-create gate and replay acquires waiting on this surface.
+    /// Runs on Lifecycle.queue.
+    private func finishSurfacePreparation(for key: SurfaceKey) {
+        Lifecycle.preparingSurfaceKeys.remove(key)
+        let deferred = Lifecycle.deferredAcquires.removeValue(forKey: key) ?? []
+        deferred.forEach { $0.perform() }
     }
 
     /// One decoded image through the remote sample-buffer layer; no live feed loop.

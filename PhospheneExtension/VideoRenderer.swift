@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreMedia
+import CoreImage
 import ObjectiveC
 import os
 
@@ -7,7 +8,7 @@ import os
 /// (a BOOL setter Apple's WallpaperExtensionKit uses on every AVSBDL). Resolved via the
 /// ObjC runtime so the private selector never appears in a header; a no-op if the API
 /// ever disappears. Prevents the layer painting opaque black before its first frame.
-private func setDisallowsVideoLayerDisplayCompositing(_ layer: CALayer, _ flag: Bool) {
+func setDisallowsVideoLayerDisplayCompositing(_ layer: CALayer, _ flag: Bool) {
     let sel = NSSelectorFromString("_setDisallowsVideoLayerDisplayCompositing:")
     guard layer.responds(to: sel),
           let imp = class_getMethodImplementation(type(of: layer), sel) else { return }
@@ -16,6 +17,11 @@ private func setDisallowsVideoLayerDisplayCompositing(_ layer: CALayer, _ flag: 
 }
 
 final class VideoRenderer: @unchecked Sendable {
+    enum StartResult: Sendable {
+        case ready
+        case failed(String)
+        case cancelled
+    }
     /// Process-wide instance counter so log lines can be attributed to a specific
     /// renderer object (to catch stale/duplicate renderers from acquire races).
     private static let idCounter = OSAllocatedUnfairLock(initialState: 0)
@@ -23,6 +29,7 @@ final class VideoRenderer: @unchecked Sendable {
 
     let displayLayer: AVSampleBufferDisplayLayer
     let timebase: CMTimebase
+    private let surfaceKey: SurfaceKey
     private let renderer: AVSampleBufferVideoRenderer
     private let queue = DispatchQueue(label: "video-renderer", qos: .userInitiated)
 
@@ -60,6 +67,9 @@ final class VideoRenderer: @unchecked Sendable {
 
     /// Diagnostic: number of remaining feed-loop ticks to log after a restart.
     private var feedLogBudget = 0
+    /// Log the first compressed picture buffer for each renderer, skipping empty
+    /// timing/control samples that AVAssetReader may emit before image samples.
+    private var didLogFirstMediaSample = false
 
     // Gapless looping state.
     // ptsOffset accumulates across loops so both DTS and PTS are monotonically increasing.
@@ -70,6 +80,7 @@ final class VideoRenderer: @unchecked Sendable {
     static func create(
         rootLayer: CALayer,
         videoURL: URL,
+        surfaceKey: SurfaceKey,
         stillImage: CGImage? = nil,
     ) async throws -> VideoRenderer {
         let asset = AVURLAsset(url: videoURL)
@@ -102,8 +113,49 @@ final class VideoRenderer: @unchecked Sendable {
             displayLayer: displayLayer,
             asset: asset,
             videoTrack: track,
+            surfaceKey: surfaceKey,
             stillImage: stillImage,
         )
+    }
+
+    /// Decode a real video image before creating a remote CAContext. The cached BMP
+    /// is only a convenience poster and is not a reliable cross-process seed.
+    static func decodeInitialFrame(videoURL: URL) async throws -> CGImage {
+        try await Task.detached(priority: .userInitiated) {
+            let asset = AVURLAsset(url: videoURL)
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            guard let track = tracks.first else {
+                throw CocoaError(.fileReadCorruptFile, userInfo: [
+                    NSLocalizedDescriptionKey: "No video track found in \(videoURL.lastPathComponent)",
+                ])
+            }
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            ])
+            output.alwaysCopiesSampleData = false
+            guard reader.canAdd(output) else {
+                throw CocoaError(.fileReadCorruptFile, userInfo: [NSLocalizedDescriptionKey: "Cannot add decoded video output"])
+            }
+            reader.add(output)
+            guard reader.startReading() else {
+                throw reader.error ?? CocoaError(.fileReadUnknown)
+            }
+            defer { if reader.status == .reading { reader.cancelReading() } }
+            while !Task.isCancelled {
+                guard let sample = output.copyNextSampleBuffer() else {
+                    throw reader.error ?? CocoaError(.fileReadCorruptFile, userInfo: [NSLocalizedDescriptionKey: "Video ended before a decoded image was available"])
+                }
+                guard CMSampleBufferDataIsReady(sample), CMSampleBufferGetNumSamples(sample) > 0,
+                      let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+                let image = CIImage(cvPixelBuffer: pixelBuffer)
+                guard let cgImage = CIContext().createCGImage(image, from: image.extent) else {
+                    throw CocoaError(.fileReadCorruptFile, userInfo: [NSLocalizedDescriptionKey: "Decoded video image could not be materialized"])
+                }
+                return cgImage
+            }
+            throw CancellationError()
+        }.value
     }
 
     private init(
@@ -111,9 +163,11 @@ final class VideoRenderer: @unchecked Sendable {
         displayLayer: AVSampleBufferDisplayLayer,
         asset: AVURLAsset,
         videoTrack: AVAssetTrack,
+        surfaceKey: SurfaceKey,
         stillImage: CGImage?,
     ) {
         self.displayLayer = displayLayer
+        self.surfaceKey = surfaceKey
         self.renderer = displayLayer.sampleBufferRenderer
         self.asset = asset
         self.videoTrack = videoTrack
@@ -158,14 +212,21 @@ final class VideoRenderer: @unchecked Sendable {
         // server for a REMOTE context — without it the still never reaches the
         // WindowServer and the desktop stays black until a later flush.
         CATransaction.flush()
+        StillSampleComparisonDiag.install(
+            rootLayer: rootLayer,
+            image: stillImage,
+            surfaceKey: surfaceKey,
+            videoName: asset.url.lastPathComponent,
+        )
     }
 
-    /// Start playback and return once the first frame is on screen.
+    /// Start playback and return once a valid media sample has reached the display
+    /// layer and the layer reports presentation readiness, with a bounded wait.
     ///
     /// The work runs on the renderer's queue: the first-frame `copyNextSampleBuffer` is
     /// a blocking decode, and blocking a cooperative thread would starve the
     /// extension's executor. It returns after the first frame is enqueued and flushed
-    /// to the render server, i.e. once this renderer's context is displaying video. The
+    /// to the render server, then waits briefly for AVSampleBufferDisplayLayer readiness. The
     /// acquire path awaits it before replying on a switch, so WallpaperAgent keeps
     /// compositing the old wallpaper until then and the host swap lands on live video,
     /// as Apple's own extensions do. It returns on every path, including early exits,
@@ -173,30 +234,33 @@ final class VideoRenderer: @unchecked Sendable {
     ///
     /// A target applied before `start()` (see `PlaybackStore.follow`) takes effect right
     /// after the first frame.
-    func start() async {
-        await withCheckedContinuation { (firstFrame: CheckedContinuation<Void, Never>) in
+    func start() async -> StartResult {
+        await withCheckedContinuation { (firstFrame: CheckedContinuation<StartResult, Never>) in
             queue.async { [self] in
-                beginPlayback { firstFrame.resume() }
+                beginPlayback { result in firstFrame.resume(returning: result) }
             }
         }
     }
 
     /// Runs on `queue`. Calls `firstFrameShown` exactly once.
-    private func beginPlayback(firstFrameShown: () -> Void) {
+    private func beginPlayback(firstFrameShown: @escaping @Sendable (StartResult) -> Void) {
         traceLog("  [start #\(debugID)] asset=\(asset.url.lastPathComponent) paused=\(isPaused)")
         guard isRunning else {
             traceLog("  [start #\(debugID)] aborted — already stopped")
-            firstFrameShown()
+            firstFrameShown(.cancelled)
             return
         }
         guard let reader = try? AVAssetReader(asset: asset) else {
-            firstFrameShown()
+            firstFrameShown(.failed("Could not create AVAssetReader"))
             return
         }
         let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
         output.alwaysCopiesSampleData = false
         reader.add(output)
-        reader.startReading()
+        guard reader.startReading() else {
+            firstFrameShown(.failed(reader.error?.localizedDescription ?? "AVAssetReader failed to start"))
+            return
+        }
         hasStarted = true
 
         // Reset the timebase before the first enqueue so the frame isn't seen as late.
@@ -205,13 +269,29 @@ final class VideoRenderer: @unchecked Sendable {
         // Enqueue the first frame and flush it to the render server inside an
         // action-free transaction, so the context is displaying video before the
         // acquire reply is released.
-        if let firstSample = output.copyNextSampleBuffer() {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            renderer.enqueue(firstSample)
-            CATransaction.commit()
-            CATransaction.flush()
+        var firstSample: CMSampleBuffer?
+        for _ in 0 ..< 64 {
+            guard let sample = output.copyNextSampleBuffer() else { break }
+            guard CMSampleBufferDataIsReady(sample), CMSampleBufferGetNumSamples(sample) > 0,
+                  CMSampleBufferGetFormatDescription(sample) != nil else {
+                traceLog("  [start #\(debugID)] skipping non-image media sample count=\(CMSampleBufferGetNumSamples(sample)) ready=\(CMSampleBufferDataIsReady(sample))")
+                continue
+            }
+            firstSample = sample
+            break
         }
+        guard let firstSample else {
+            reader.cancelReading()
+            hasStarted = false
+            firstFrameShown(.failed(reader.error?.localizedDescription ?? "No decoded video sample found within 64 samples"))
+            return
+        }
+        logSamplePresentationDiagnostics(firstSample, phase: "first")
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        renderer.enqueue(firstSample)
+        CATransaction.commit()
+        CATransaction.flush()
 
         currentReader = reader
         currentOutput = output
@@ -219,7 +299,7 @@ final class VideoRenderer: @unchecked Sendable {
         lastEnqueuedEnd = .zero
 
         CMTimebaseSetRate(timebase, rate: 1.0)
-        firstFrameShown()
+        schedulePresentationSnapshots(phase: "pipeline-start")
         if isPaused {
             holdAfterFirstFrame()
             scheduleDeepPause()
@@ -227,6 +307,86 @@ final class VideoRenderer: @unchecked Sendable {
 
         prepareNextReader()
         feedFromCurrentReader()
+        waitForFirstPresentation(firstFrameShown, attempt: 0)
+    }
+
+    /// Poll readiness asynchronously on the renderer's queue. Enqueue success alone
+    /// is not an XPC handoff guarantee; cap the wait so a failed decoder cannot hang
+    /// WallpaperAgent's acquire request indefinitely.
+    private func waitForFirstPresentation(_ completion: @escaping @Sendable (StartResult) -> Void, attempt: Int) {
+        queue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self else { completion(.cancelled); return }
+            guard isRunning else { completion(.cancelled); return }
+            if displayLayer.isReadyForDisplay {
+                completion(.ready)
+            } else if renderer.status == .failed {
+                completion(.failed(renderer.error?.localizedDescription ?? "Video renderer entered failed state"))
+            } else if attempt >= 100 {
+                completion(.failed("Display layer did not become ready within 5 seconds"))
+            } else {
+                waitForFirstPresentation(completion, attempt: attempt + 1)
+            }
+        }
+    }
+
+    /// Record the compressed sample geometry and display-layer readiness around a
+    /// fresh surface acquire. The layer's CALayer frame can be full-size while the
+    /// AVSampleBufferDisplayLayer's presented image is not, so these are logged
+    /// independently from GeometryDiagnostics.
+    private func logSamplePresentationDiagnostics(_ sample: CMSampleBuffer, phase: String) {
+        let sampleCount = CMSampleBufferGetNumSamples(sample)
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+        let duration = CMSampleBufferGetDuration(sample)
+        guard let format = CMSampleBufferGetFormatDescription(sample) else {
+            traceLog("  [presentation #\(debugID)] surface=\(surfaceKey) video=\(asset.url.lastPathComponent) phase=\(phase) no-format-description samples=\(sampleCount) pts=\(pts.seconds) duration=\(duration.seconds) dataReady=\(CMSampleBufferDataIsReady(sample))")
+            return
+        }
+        let coded = CMVideoFormatDescriptionGetDimensions(format)
+        let presented = CMVideoFormatDescriptionGetPresentationDimensions(
+            format,
+            usePixelAspectRatio: true,
+            useCleanAperture: true,
+        )
+        let aperture = CMVideoFormatDescriptionGetCleanAperture(format, originIsAtTopLeft: true)
+        traceLog(
+            "  [presentation #\(debugID)] surface=\(surfaceKey) video=\(asset.url.lastPathComponent) phase=\(phase) samples=\(sampleCount) dataReady=\(CMSampleBufferDataIsReady(sample)) subtype=\(format.mediaSubType) " +
+                "coded=\(coded.width)x\(coded.height) presentation=\(presented.width)x\(presented.height) " +
+                "cleanAperture=\(aperture) pts=\(pts.seconds) duration=\(duration.seconds) " +
+                "layerFrame=\(displayLayer.frame) layerBounds=\(displayLayer.bounds) " +
+                "contentsScale=\(displayLayer.contentsScale) gravity=\(displayLayer.videoGravity.rawValue)",
+        )
+    }
+
+    /// isReadyForDisplay is distinct from having enqueued/flushed a first sample.
+    /// A few snapshots establish whether the layer reaches presentation readiness
+    /// after a display topology change without logging every frame.
+    private func schedulePresentationSnapshots(phase: String) {
+        for delay in [0.25, 1.0, 3.0, 5.0, 10.0, 20.0, 30.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                let ready: String
+                if #available(macOS 14.4, *) {
+                    ready = String(displayLayer.isReadyForDisplay)
+                } else {
+                    ready = "unavailable"
+                }
+                let presentationGeometry: String
+                if let presentationLayer = displayLayer.presentation() {
+                    presentationGeometry = "presentation{frame=\(presentationLayer.frame) bounds=\(presentationLayer.bounds) position=\(presentationLayer.position) anchor=\(presentationLayer.anchorPoint) transform=\(presentationLayer.transform) contentsRect=\(presentationLayer.contentsRect)}"
+                } else {
+                    presentationGeometry = "presentation{none}"
+                }
+                traceLog(
+                    "  [presentation #\(debugID)] surface=\(surfaceKey) video=\(asset.url.lastPathComponent) phase=\(phase) snapshot=\(delay)s readyForDisplay=\(ready) " +
+                        "rendererStatus=\(renderer.status.rawValue) readyForMore=\(renderer.isReadyForMoreMediaData) " +
+                        "requiresFlush=\(renderer.requiresFlushToResumeDecoding) timebaseRate=\(CMTimebaseGetRate(timebase)) " +
+                        "timebaseTime=\(CMTimebaseGetTime(timebase).seconds) layerFrame=\(displayLayer.frame) " +
+                        "layerBounds=\(displayLayer.bounds) position=\(displayLayer.position) anchor=\(displayLayer.anchorPoint) " +
+                        "transform=\(displayLayer.transform) contentsRect=\(displayLayer.contentsRect) contentsScale=\(displayLayer.contentsScale) " +
+                        "gravity=\(displayLayer.videoGravity.rawValue) \(presentationGeometry) error=\(renderer.error?.localizedDescription ?? "-" )",
+                )
+            }
+        }
     }
 
     /// Re-frame the video layer to a new destination geometry (points) and backing
@@ -784,6 +944,13 @@ final class VideoRenderer: @unchecked Sendable {
             var enqueuedThisTick = 0
             while renderer.isReadyForMoreMediaData {
                 if let sample = currentOutput?.copyNextSampleBuffer() {
+                    if !didLogFirstMediaSample, CMSampleBufferGetNumSamples(sample) > 0,
+                       CMSampleBufferGetFormatDescription(sample) != nil
+                    {
+                        didLogFirstMediaSample = true
+                        logSamplePresentationDiagnostics(sample, phase: "first-media")
+                        schedulePresentationSnapshots(phase: "first-media")
+                    }
                     let adjusted = offsetTimingForLoop(sample)
                     enqueuedThisTick += 1
 
