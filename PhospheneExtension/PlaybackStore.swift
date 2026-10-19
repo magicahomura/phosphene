@@ -64,9 +64,23 @@ final class PlaybackStore {
         let next = PlaybackReducer.reduce(state, event)
         traceLog("[Store] \(event)")
         guard next != state else { return }
+        logPauseReasonChanges(from: state, to: next)
         state = next
         Self.mirror.withLock { $0 = next }
         republishTargets()
+    }
+
+    private func logPauseReasonChanges(from old: PlaybackState, to new: PlaybackState) {
+        for key in Set(old.surfaces.keys).union(new.surfaces.keys) {
+            let oldReason = old.surfaces[key].flatMap { PlaybackReducer.pauseReason(for: $0, in: old) }
+            let newReason = new.surfaces[key].flatMap { PlaybackReducer.pauseReason(for: $0, in: new) }
+            guard oldReason != newReason else { continue }
+            if let newReason {
+                extensionLog("[Policy] \(key) paused: \(newReason)")
+            } else if let oldReason {
+                extensionLog("[Policy] \(key) resumed (was paused: \(oldReason))")
+            }
+        }
     }
 
     private func republishTargets() {

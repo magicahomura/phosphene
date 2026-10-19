@@ -13,6 +13,7 @@ struct PlaybackPolicyTests {
         userPaused: Bool = false,
         alwaysPauseDesktop: Bool = false,
         pauseWhenOccluded: Bool = false,
+        keepPlayingWhenCovered: Bool = false,
         desktopOccluded: Bool = false,
         displayHasFullscreenApp: Bool = false,
         screenSaverIsOurs: Bool = false,
@@ -28,6 +29,7 @@ struct PlaybackPolicyTests {
             userPaused: userPaused,
             alwaysPauseDesktop: alwaysPauseDesktop,
             pauseWhenOccluded: pauseWhenOccluded,
+            keepPlayingWhenCovered: keepPlayingWhenCovered,
             desktopOccluded: desktopOccluded,
             displayHasFullscreenApp: displayHasFullscreenApp,
             screenSaverIsOurs: screenSaverIsOurs,
@@ -71,6 +73,32 @@ struct PlaybackPolicyTests {
     @Test
     func `fullscreen app is irrelevant when our screensaver presents`() {
         #expect(policy(presentationMode: .idle, displayHasFullscreenApp: true, screenSaverIsOurs: true) == .full)
+    }
+
+    @Test
+    func `keep playing setting bypasses both coverage pause paths`() {
+        #expect(policy(
+            pauseWhenOccluded: true,
+            keepPlayingWhenCovered: true,
+            desktopOccluded: true,
+            displayHasFullscreenApp: true,
+        ) == .full)
+    }
+
+    @Test
+    func `keep playing setting preserves manual and system pauses`() {
+        #expect(policy(userPaused: true, keepPlayingWhenCovered: true) == .paused)
+        #expect(policy(activityState: .suspended, keepPlayingWhenCovered: true) == .paused)
+        #expect(policy(keepPlayingWhenCovered: true, thermalState: .critical) == .paused)
+        #expect(policy(keepPlayingWhenCovered: true, isGameModeActive: true) == .paused)
+    }
+
+    @Test
+    func `keep playing preference decodes old files and explicit opt in`() throws {
+        let old = try JSONDecoder().decode(PlaybackPrefs.self, from: Data("{}".utf8))
+        let optedIn = try JSONDecoder().decode(PlaybackPrefs.self, from: Data("{\"keepPlayingWhenCovered\":true}".utf8))
+        #expect(old.keepPlayingWhenCovered == false)
+        #expect(optedIn.keepPlayingWhenCovered == true)
     }
 
     // MARK: - Occlusion tier (gated by the setting)

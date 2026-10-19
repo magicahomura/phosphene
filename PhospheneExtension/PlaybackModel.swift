@@ -29,12 +29,14 @@ nonisolated struct PlaybackPrefs: Decodable, Equatable, Sendable {
     var userPaused = false
     var alwaysPauseDesktop = false
     var pauseWhenOccluded = false
+    /// Explicitly overrides only window-coverage and fullscreen-app pauses.
+    var keepPlayingWhenCovered = false
     /// Every display is covered. Written by app versions that predate per-display
     /// occlusion, and still set when all displays are covered.
     var desktopOccluded = false
     var occludedDisplays: Set<UInt32> = []
     /// Displays owned by one fullscreen app (native fullscreen Space or a borderless
-    /// fullscreen game).
+    /// fullscreen game). The final policy may ignore this when requested by the user.
     var fullscreenDisplays: Set<UInt32> = []
     var pausedDisplays: Set<UInt32> = []
     var screenSaverIsOurs = false
@@ -46,6 +48,7 @@ nonisolated struct PlaybackPrefs: Decodable, Equatable, Sendable {
         userPaused = try container.decodeIfPresent(Bool.self, forKey: .userPaused) ?? false
         alwaysPauseDesktop = try container.decodeIfPresent(Bool.self, forKey: .alwaysPauseDesktop) ?? false
         pauseWhenOccluded = try container.decodeIfPresent(Bool.self, forKey: .pauseWhenOccluded) ?? false
+        keepPlayingWhenCovered = try container.decodeIfPresent(Bool.self, forKey: .keepPlayingWhenCovered) ?? false
         desktopOccluded = try container.decodeIfPresent(Bool.self, forKey: .desktopOccluded) ?? false
         occludedDisplays = try container.decodeIfPresent(Set<UInt32>.self, forKey: .occludedDisplays) ?? []
         fullscreenDisplays = try container.decodeIfPresent(Set<UInt32>.self, forKey: .fullscreenDisplays) ?? []
@@ -57,6 +60,7 @@ nonisolated struct PlaybackPrefs: Decodable, Equatable, Sendable {
         case userPaused
         case alwaysPauseDesktop
         case pauseWhenOccluded
+        case keepPlayingWhenCovered
         case desktopOccluded
         case occludedDisplays
         case fullscreenDisplays
@@ -80,7 +84,8 @@ nonisolated struct PlaybackPrefs: Decodable, Equatable, Sendable {
     /// Whether the window-coverage inputs differ, which is what makes a prefs change
     /// ramp (a window uncovering the desktop) instead of cutting.
     func coverageDiffers(from other: PlaybackPrefs) -> Bool {
-        desktopOccluded != other.desktopOccluded
+        keepPlayingWhenCovered != other.keepPlayingWhenCovered
+            || desktopOccluded != other.desktopOccluded
             || occludedDisplays != other.occludedDisplays
             || fullscreenDisplays != other.fullscreenDisplays
     }
@@ -218,12 +223,41 @@ nonisolated enum PlaybackReducer {
             userPaused: prefs.isUserPaused(displayID: surface.displayID),
             alwaysPauseDesktop: prefs.alwaysPauseDesktop,
             pauseWhenOccluded: prefs.pauseWhenOccluded,
+            keepPlayingWhenCovered: prefs.keepPlayingWhenCovered,
             desktopOccluded: prefs.isOccluded(displayID: surface.displayID),
             displayHasFullscreenApp: prefs.hasFullscreenApp(displayID: surface.displayID),
             screenSaverIsOurs: prefs.screenSaverIsOurs,
             power: state.power,
         )
         return SurfaceTarget(policy: policy, ramps: surface.ramps)
+    }
+
+    /// Stable explanation for a paused desktop surface, used only when the reason
+    /// changes so state diagnostics do not pollute the extension log.
+    static func pauseReason(for surface: Surface, in state: PlaybackState) -> String? {
+        if state.displaysAsleep { return "displays asleep" }
+        let mode: PresentationMode = state.screenLocked && surface.mode == .default ? .locked : surface.mode
+        let fullScreenPresentation = mode == .locked || (mode == .idle && state.prefs.screenSaverIsOurs)
+        let prefs = state.prefs
+        let power = state.power
+
+        if prefs.isUserPaused(displayID: surface.displayID) { return "manual pause" }
+        if power.thermalState == .critical { return "critical thermal state" }
+        if power.batteryLevel < 10 { return "critical battery" }
+        if surface.activity == .suspended { return "WallpaperAgent suspended the surface" }
+        if mode == .idle, !prefs.screenSaverIsOurs { return "another screen saver is active" }
+        if power.isGameModeActive { return "Game Mode" }
+        if power.displayBrightness < PlaybackPolicy.brightnessPauseThreshold { return "display brightness is near zero" }
+        if !fullScreenPresentation {
+            if !prefs.keepPlayingWhenCovered, prefs.pauseWhenOccluded, prefs.isOccluded(displayID: surface.displayID) {
+                return "display covered by windows"
+            }
+            if !prefs.keepPlayingWhenCovered, prefs.hasFullscreenApp(displayID: surface.displayID) {
+                return "fullscreen app detected"
+            }
+            if prefs.alwaysPauseDesktop { return "lock-screen-only mode" }
+        }
+        return nil
     }
 
     static func published(_ state: PlaybackState) -> PublishedState {

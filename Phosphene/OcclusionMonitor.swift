@@ -24,9 +24,8 @@ final class OcclusionMonitor {
     /// Display IDs whose usable area is ≥95% covered by windows.
     private(set) var occludedDisplays: Set<UInt32> = []
     /// Display IDs owned by a single fullscreen app — a native fullscreen Space,
-    /// or a borderless-fullscreen game. These pause unconditionally: the wallpaper
-    /// is invisible (or reduced to the menu bar sliver) and the app wants the
-    /// hardware. "Pause When Hidden" only governs `occludedDisplays`.
+    /// or a borderless-fullscreen game. The playback policy may ignore this signal
+    /// when the user enables continuous playback under covered windows.
     private(set) var fullscreenDisplays: Set<UInt32> = []
     /// Every display is occluded (the pre-per-display global signal; still
     /// written to prefs so the popover's status line can say "Desktop Hidden").
@@ -35,6 +34,7 @@ final class OcclusionMonitor {
     private var activateObserver: (any NSObjectProtocol)?
     private var spaceObserver: (any NSObjectProtocol)?
     private var deactivateObserver: (any NSObjectProtocol)?
+    private var displayParametersObserver: (any NSObjectProtocol)?
     @ObservationIgnored private var scheduler: NSBackgroundActivityScheduler?
 
     func startMonitoring() {
@@ -69,6 +69,17 @@ final class OcclusionMonitor {
             object: nil, queue: .main,
         ) { [weak self] _ in
             MainActor.assumeIsolated {
+                self?.checkOcclusion()
+            }
+        }
+
+        displayParametersObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main,
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                // Recompute against the new online-display set immediately, so a
+                // disconnected display's ID cannot retain stale coverage state.
                 self?.checkOcclusion()
             }
         }

@@ -37,6 +37,12 @@ final class WallpaperPrefsService {
         didSet { guard pauseWhenOccluded != oldValue else { return }; savePrefs() }
     }
 
+    /// Keep desktop videos playing when windows cover the display or a fullscreen
+    /// app is detected. Manual and system/power safeguards remain in force.
+    var keepPlayingWhenCovered = false {
+        didSet { guard keepPlayingWhenCovered != oldValue else { return }; savePrefs() }
+    }
+
     /// Updated by OcclusionMonitor when desktop visibility changes.
     /// True only when every display is fully covered.
     var desktopOccluded = false {
@@ -51,8 +57,8 @@ final class WallpaperPrefsService {
     }
 
     /// Displays owned by a single fullscreen app (native fullscreen Space or
-    /// borderless-fullscreen game). The extension pauses these unconditionally —
-    /// "Pause When Hidden" only governs `occludedDisplays`.
+    /// borderless-fullscreen game). The extension can ignore this signal when the
+    /// user enables continuous playback under covered windows.
     var fullscreenDisplays: Set<UInt32> = [] {
         didSet { guard fullscreenDisplays != oldValue else { return }; savePrefs() }
     }
@@ -120,16 +126,18 @@ final class WallpaperPrefsService {
         var userPaused: Bool
         var alwaysPauseDesktop: Bool
         var pauseWhenOccluded: Bool
+        var keepPlayingWhenCovered: Bool?
         var desktopOccluded: Bool
         var occludedDisplays: Set<UInt32>?
         var fullscreenDisplays: Set<UInt32>?
         var pausedDisplays: Set<UInt32>?
         var screenSaverIsOurs: Bool?
 
-        init(userPaused: Bool, alwaysPauseDesktop: Bool, pauseWhenOccluded: Bool = false, desktopOccluded: Bool = false, occludedDisplays: Set<UInt32>? = nil, fullscreenDisplays: Set<UInt32>? = nil, pausedDisplays: Set<UInt32>? = nil, screenSaverIsOurs: Bool? = nil) {
+        init(userPaused: Bool, alwaysPauseDesktop: Bool, pauseWhenOccluded: Bool = false, keepPlayingWhenCovered: Bool = false, desktopOccluded: Bool = false, occludedDisplays: Set<UInt32>? = nil, fullscreenDisplays: Set<UInt32>? = nil, pausedDisplays: Set<UInt32>? = nil, screenSaverIsOurs: Bool? = nil) {
             self.userPaused = userPaused
             self.alwaysPauseDesktop = alwaysPauseDesktop
             self.pauseWhenOccluded = pauseWhenOccluded
+            self.keepPlayingWhenCovered = keepPlayingWhenCovered
             self.desktopOccluded = desktopOccluded
             self.occludedDisplays = occludedDisplays
             self.fullscreenDisplays = fullscreenDisplays
@@ -238,6 +246,7 @@ final class WallpaperPrefsService {
             userPaused = prefs.userPaused
             alwaysPauseDesktop = prefs.alwaysPauseDesktop
             pauseWhenOccluded = prefs.pauseWhenOccluded
+            keepPlayingWhenCovered = prefs.keepPlayingWhenCovered ?? false
             desktopOccluded = prefs.desktopOccluded
             occludedDisplays = prefs.occludedDisplays ?? []
             fullscreenDisplays = prefs.fullscreenDisplays ?? []
@@ -252,6 +261,7 @@ final class WallpaperPrefsService {
             userPaused: userPaused,
             alwaysPauseDesktop: alwaysPauseDesktop,
             pauseWhenOccluded: pauseWhenOccluded,
+            keepPlayingWhenCovered: keepPlayingWhenCovered,
             desktopOccluded: desktopOccluded,
             occludedDisplays: occludedDisplays.isEmpty ? nil : occludedDisplays,
             fullscreenDisplays: fullscreenDisplays.isEmpty ? nil : fullscreenDisplays,

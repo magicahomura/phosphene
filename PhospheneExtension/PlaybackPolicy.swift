@@ -105,6 +105,7 @@ nonisolated enum PlaybackPolicy: Int, Comparable, Sendable {
         userPaused: Bool,
         alwaysPauseDesktop: Bool,
         pauseWhenOccluded: Bool,
+        keepPlayingWhenCovered: Bool = false,
         desktopOccluded: Bool,
         displayHasFullscreenApp: Bool = false,
         screenSaverIsOurs: Bool,
@@ -142,13 +143,13 @@ nonisolated enum PlaybackPolicy: Int, Comparable, Sendable {
             worst = max(worst, .paused)
         }
         // Desktop occlusion is irrelevant on full-screen presentations.
-        if pauseWhenOccluded, desktopOccluded, !fullScreenPresentation {
+        if !keepPlayingWhenCovered, pauseWhenOccluded, desktopOccluded, !fullScreenPresentation {
             worst = max(worst, .paused)
         }
-        // A fullscreen app owning the display pauses unconditionally: the wallpaper is
-        // invisible and the app wants the hardware. Catches what Game Mode can't —
-        // gamepolicyd never recognizes Wine games.
-        if displayHasFullscreenApp, !fullScreenPresentation {
+        // A fullscreen app owning the display pauses unless the user explicitly asks
+        // for continuous playback. Catches what Game Mode can't — gamepolicyd never
+        // recognizes Wine games.
+        if !keepPlayingWhenCovered, displayHasFullscreenApp, !fullScreenPresentation {
             worst = max(worst, .paused)
         }
         if alwaysPauseDesktop, !fullScreenPresentation {

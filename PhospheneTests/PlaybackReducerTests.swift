@@ -247,6 +247,36 @@ struct PlaybackReducerTests {
         #expect(policy(otherDisplay, state) == .full)
     }
 
+    @Test
+    func `keep playing under coverage does not bypass per display pause`() {
+        let state = run([
+            acquire(desktop),
+            acquire(otherDisplay),
+            prefs {
+                $0.keepPlayingWhenCovered = true
+                $0.fullscreenDisplays = [1, 2]
+                $0.pausedDisplays = [2]
+            },
+        ])
+        #expect(policy(desktop, state) == .full)
+        #expect(policy(otherDisplay, state) == .paused)
+        #expect(PlaybackReducer.pauseReason(for: state.surfaces[otherDisplay]!, in: state) == "manual pause")
+    }
+
+    @Test
+    func `fullscreen pause reason is per display and clears when ignored`() {
+        let paused = run([
+            acquire(desktop),
+            acquire(otherDisplay),
+            prefs { $0.fullscreenDisplays = [2] },
+        ])
+        #expect(PlaybackReducer.pauseReason(for: paused.surfaces[desktop]!, in: paused) == nil)
+        #expect(PlaybackReducer.pauseReason(for: paused.surfaces[otherDisplay]!, in: paused) == "fullscreen app detected")
+
+        let resumed = run([prefs { $0.keepPlayingWhenCovered = true; $0.fullscreenDisplays = [2] }], from: paused)
+        #expect(PlaybackReducer.pauseReason(for: resumed.surfaces[otherDisplay]!, in: resumed) == nil)
+    }
+
     // MARK: - Published state
 
     /// The agent never sends `selectedChoicesDidChange` to us on macOS 27, so the
