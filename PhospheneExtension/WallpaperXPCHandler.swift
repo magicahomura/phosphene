@@ -127,7 +127,8 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     }
 
     private func acquireBody(id: Any?, request: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
-        traceLog("=== ACQUIRE ===")
+        let acquireID = String(UUID().uuidString.prefix(8))
+        traceLog("=== ACQUIRE \(acquireID) ===")
 
         // Extract destination size from WallpaperCreationRequestXPC
         var destSize = CGSize(width: 2_560, height: 1_440) // fallback
@@ -198,7 +199,8 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             }
         }
 
-        traceLog("  destination: \(destSize) @\(scaleFactor)x, isPreview: \(isPreview), pid: \(connectionPID), choice: \(choiceConfiguration ?? "nil"), files: \(choiceFiles)")
+        let renderPixels = CGSize(width: destSize.width * scaleFactor, height: destSize.height * scaleFactor)
+        traceLog("  [acquire=\(acquireID)] destination: \(destSize) points / \(renderPixels) pixels @\(scaleFactor)x, display: \(displayID.map(String.init) ?? "nil"), isPreview: \(isPreview), pid: \(connectionPID), choice: \(choiceConfiguration ?? "nil"), files: \(choiceFiles)")
 
         // Native shuffle: adopt the frequency the host sent (optionValues in the
         // descriptor; absent until the user touches the picker), then resolve the
@@ -236,7 +238,8 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
 
         // ---- REUSE: this surface's context already exists ----
         if let existing = registry.surface(for: key) {
-            traceLog("  [acquire] REUSE ctx=\(existing.contextId) \(key) storedVideoID=\(existing.videoID ?? "nil") newChoice=\(choiceConfiguration ?? "nil") renderer=\(existing.renderer.map { "#\($0.debugID)" } ?? "nil")")
+            traceLog("  [acquire=\(acquireID)] REUSE ctx=\(existing.contextId) \(key) storedVideoID=\(existing.videoID ?? "nil") newChoice=\(choiceConfiguration ?? "nil") renderer=\(existing.renderer.map { "#\($0.debugID)" } ?? "nil")")
+            traceSurfaceGeometry("reuse-before", acquireID: acquireID, key: key, contextID: existing.contextId, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: existing.rootLayer, videoLayer: existing.renderer?.displayLayer, rendererID: existing.renderer?.debugID, cachedStill: cachedStill)
 
             // Geometry may have changed since this surface was created: a bigger or
             // smaller display reconnected, or the display switched resolution. Re-frame
@@ -249,8 +252,10 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
                 CATransaction.commit()
                 CATransaction.flush()
                 resized.renderer?.resize(to: destSize, scale: scaleFactor)
-                extensionLog("  [acquire] REUSE geometry changed → resized \(key) to \(destSize) @\(scaleFactor)x")
+                extensionLog("  [acquire=\(acquireID)] REUSE geometry changed → resized \(key) to \(destSize) @\(scaleFactor)x")
             }
+
+            traceSurfaceGeometry("reuse-ready", acquireID: acquireID, key: key, contextID: existing.contextId, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: existing.rootLayer, videoLayer: existing.renderer?.displayLayer, rendererID: existing.renderer?.debugID, cachedStill: cachedStill)
 
             guard let replyObj = createRemoteContextXPC(contextId: existing.contextId) else {
                 reply(nil, NSError(domain: "PhospheneExtension", code: 3, userInfo: nil)); return
@@ -326,6 +331,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         }
         caContext.layer = rootLayer
         CATransaction.flush()
+        traceSurfaceGeometry("context-created", acquireID: acquireID, key: key, contextID: contextId, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: rootLayer, cachedStill: cachedStill)
 
         guard let replyObj = createRemoteContextXPC(contextId: contextId) else {
             reply(nil, NSError(domain: "PhospheneExtension", code: 3, userInfo: nil)); return
@@ -337,7 +343,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             HostedSurface(caContext: caContext, contextId: contextId, rootLayer: rootLayer, renderer: nil, displayID: displayID, videoID: choiceConfiguration, isPreview: isPreview, destSize: destSize, scaleFactor: scaleFactor),
             for: key,
         )
-        extensionLog("  Created context \(contextId) for \(key)")
+        extensionLog("  [acquire=\(acquireID)] Created context \(contextId) for \(key)")
 
         // The XPC reply is deferred until the new context displays video. WallpaperAgent
         // hosts a context only after it receives the reply and keeps compositing the old
@@ -390,7 +396,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             let boxedRoot = SendableBox(value: rootLayer)
             let boxedReply = SendableBox(value: replyObj)
             let selector = makeVariantSelector(choice: renderChoice, fallback: videoURL)
-            Task(name: "Create renderer \(key)") { [coldStart, boxedRoot, boxedReply, videoURL, cachedStill, selector, key, choiceConfiguration] in
+            Task(name: "Create renderer \(key)") { [coldStart, boxedRoot, boxedReply, videoURL, cachedStill, selector, key, choiceConfiguration, acquireID, contextID = contextId, destSize, scaleFactor] in
                 let renderer: VideoRenderer
                 do {
                     renderer = try await VideoRenderer.create(rootLayer: boxedRoot.value, videoURL: videoURL, stillImage: cachedStill)
@@ -400,6 +406,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
                     reply(boxedReply.value, nil) // unblock the acquire regardless
                     return
                 }
+                traceSurfaceGeometry("renderer-created", acquireID: acquireID, key: key, contextID: contextID, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: boxedRoot.value, videoLayer: renderer.displayLayer, rendererID: renderer.debugID, cachedStill: cachedStill)
                 // Cold start: the IOSurface still is seeded and flushed, so the agent can
                 // host our context without a black gap while the video comes up over it.
                 if coldStart {
@@ -410,6 +417,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
                 let old = SurfaceRegistry.shared.setRenderer(renderer, videoID: choiceConfiguration, for: key)
                 await PlaybackStore.shared.follow(renderer, surface: key)
                 await renderer.start()
+                traceSurfaceGeometry("first-frame-ready", acquireID: acquireID, key: key, contextID: contextID, logicalSize: destSize, scaleFactor: scaleFactor, rootLayer: boxedRoot.value, videoLayer: renderer.displayLayer, rendererID: renderer.debugID, cachedStill: cachedStill)
                 // Switch: reply once the first frame is composited. Either way, stop the
                 // old renderer once the agent has been told to swap off it.
                 if !coldStart {
@@ -502,9 +510,14 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             }
         }
 
+        let updateID = String(UUID().uuidString.prefix(8))
         let key = extractWallpaperUUID(fromID: id).flatMap { SurfaceRegistry.shared.key(forWallpaperID: $0) }
+        let surface = key.flatMap { SurfaceRegistry.shared.surface(for: $0) }
         PlaybackStore.post(.agentUpdate(key, mode: mode, activity: activity))
-        extensionLog("=== UPDATE (pid \(connectionPID)) === \(key.map(\.description) ?? "unknown surface → all") mode: \(mode), activity: \(activity)")
+        extensionLog("=== UPDATE \(updateID) (pid \(connectionPID)) === \(key.map(\.description) ?? "unknown surface → all") ctx=\(surface.map { String($0.contextId) } ?? "nil") mode: \(mode), activity: \(activity)")
+        if let key, let surface {
+            traceSurfaceGeometry("agent-update", acquireID: updateID, key: key, contextID: surface.contextId, logicalSize: surface.destSize, scaleFactor: surface.scaleFactor, rootLayer: surface.rootLayer, videoLayer: surface.renderer?.displayLayer, rendererID: surface.renderer?.debugID)
+        }
         reply(nil)
     }
 
